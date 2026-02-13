@@ -1,26 +1,25 @@
 apiVersion: app.sealos.io/v1
 kind: Template
 metadata:
-  name: mautic
+  name: mautic-apache
 spec:
-  title: 'mautic'
+  title: 'Mautic Apache'
   url: 'https://www.mautic.org/'
   gitRepo: 'https://github.com/mautic/mautic'
   author: 'Sealos'
-  description: 'Mautic is the world’s largest open source marketing automation software.'
+  description: 'Mautic is the world''s largest open source marketing automation software - Apache version with RabbitMQ 4 & MySQL 8.4 (KubeBlocks).'
   readme: 'https://raw.githubusercontent.com/mautic/mautic/refs/heads/6.x/README.md'
   icon: 'https://avatars.githubusercontent.com/u/5257677?s=48&v=4'
   templateType: inline
   locale: en
   i18n:
     zh:
-      title: 'Mautic'
-      description: 'Mautic 是一款开源的营销自动化平台，提供电子邮件营销、客户旅程设计、潜在客户管理和行为跟踪等功能，帮助企业自动化营销流程、分析用户互动并个性化客户体验。'
+      title: 'Mautic Apache'
+      description: 'Mautic 是一款开源的营销自动化平台 - Apache版本，包含RabbitMQ 4 和 KubeBlocks MySQL 8.4。'
   categories:
     - tool
   defaults:
     app_host:
-      # number or string..
       type: string
       value: mautic-${{ random(8) }}
     app_name:
@@ -86,8 +85,8 @@ metadata:
   finalizers:
     - cluster.kubeblocks.io/finalizer
   labels:
-    clusterdefinition.kubeblocks.io/name: apecloud-mysql
-    clusterversion.kubeblocks.io/name: ac-mysql-8.0.30-1
+    clusterdefinition.kubeblocks.io/name: mysql
+    clusterversion.kubeblocks.io/name: mysql-8.4.2
   name: ${{ defaults.app_name }}-mysql
 spec:
   affinity:
@@ -95,8 +94,8 @@ spec:
     podAntiAffinity: Preferred
     tenancy: SharedNode
     topologyKeys: []
-  clusterDefinitionRef: apecloud-mysql
-  clusterVersionRef: ac-mysql-8.0.30-1
+  clusterDefinitionRef: mysql
+  clusterVersionRef: mysql-8.4.2
   componentSpecs:
     - componentDefRef: mysql
       monitor: true
@@ -133,7 +132,7 @@ spec:
     spec:
       containers:
         - name: mysql-init
-          image: joseluisq/mysql-client:8.0.30
+          image: joseluisq/mysql-client:8.4
           imagePullPolicy: IfNotPresent
           env:
             - name: MAUTIC_USER
@@ -167,29 +166,88 @@ spec:
 
 ---
 apiVersion: v1
-kind: ConfigMap
+kind: Secret
 metadata:
-  name: ${{ defaults.app_name }}
-data:
-  vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf: |-
-    server {
-        listen 0.0.0.0:80;
-        
-        root /var/www/html/docroot;
-        
-        location / {
-            index index.php;
-            try_files $uri $uri/ /index.php?$query_string;
-        }
-    
-        location ~ \.php$ {
-            include fastcgi_params;
-            fastcgi_param HTTPS "on";
-            fastcgi_pass 127.0.0.1:9000;
-            fastcgi_index index.php;
-            fastcgi_param SCRIPT_FILENAME $document_root/$fastcgi_script_name;
-        }
-    }
+  name: ${{ defaults.app_name }}-rabbitmq
+type: Opaque
+stringData:
+  username: mautic
+  password: ${{ random(16) }}
+  vhost: mautic
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${{ defaults.app_name }}-rabbitmq
+  labels:
+    app: ${{ defaults.app_name }}-rabbitmq
+spec:
+  replicas: 1
+  serviceName: ${{ defaults.app_name }}-rabbitmq
+  selector:
+    matchLabels:
+      app: ${{ defaults.app_name }}-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: ${{ defaults.app_name }}-rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:4
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: username
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: password
+            - name: RABBITMQ_DEFAULT_VHOST
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: vhost
+          ports:
+            - containerPort: 5672
+              name: amqp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: rabbitmq-data
+              mountPath: /var/lib/rabbitmq
+  volumeClaimTemplates:
+    - metadata:
+        name: rabbitmq-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${{ defaults.app_name }}-rabbitmq
+  labels:
+    app: ${{ defaults.app_name }}-rabbitmq
+spec:
+  ports:
+    - port: 5672
+      name: amqp
+  selector:
+    app: ${{ defaults.app_name }}-rabbitmq
 
 ---
 apiVersion: apps/v1
@@ -197,7 +255,7 @@ kind: StatefulSet
 metadata:
   name: ${{ defaults.app_name }}
   annotations:
-    originImageName: mautic/mautic:5.2.3-fpm
+    originImageName: mautic/mautic:latest
     deploy.cloud.sealos.io/minReplicas: '1'
     deploy.cloud.sealos.io/maxReplicas: '1'
   labels:
@@ -220,15 +278,36 @@ spec:
       automountServiceAccountToken: false
       initContainers:
         - name: take-data-dir-ownership
-          image: mautic/mautic:5.2.3-fpm
-          command: ["/bin/sh", "-c", "if [ ! -f /data/docroot/index.php ]; then cp -rf /var/www/html/docroot/* /data/; chown -R 33:33 /data; fi"]
+          image: mautic/mautic:latest
+          command: 
+            - "/bin/sh"
+            - "-c"
+            - |
+              if [ -z "$(ls -A /data/config)" ]; then
+                cp -rn /var/www/html/config/* /data/config/
+              fi
+              if [ -z "$(ls -A /data/media/files)" ]; then
+                cp -rn /var/www/html/docroot/media/files/* /data/media/files/
+              fi
+              if [ -z "$(ls -A /data/media/images)" ]; then
+                cp -rn /var/www/html/docroot/media/images/* /data/media/images/
+              fi
+              chown -R www-data:www-data /data
           imagePullPolicy: IfNotPresent
           volumeMounts:
-            - name: vn-varvn-wwwvn-htmlvn-docroot
-              mountPath: /data
+            - name: vn-varvn-wwwvn-htmlvn-config
+              mountPath: /data/config
+            - name: vn-varvn-wwwvn-htmlvn-varvn-logs
+              mountPath: /data/logs
+            - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
+              mountPath: /data/media/files
+            - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
+              mountPath: /data/media/images
+            - name: vn-optvn-mauticvn-cron
+              mountPath: /data/cron
       containers:
         - name: ${{ defaults.app_name }}
-          image: mautic/mautic:5.2.3-fpm
+          image: mautic/mautic:latest
           env:
             - name: PHP_INI_VALUE_DATE_TIMEZONE
               value: "${{ inputs.TIMEZONE }}"
@@ -236,6 +315,7 @@ spec:
               value: 'false'
             - name: DOCKER_MAUTIC_LOAD_TEST_DATA
               value: 'false'
+            # DB Config
             - name: MAUTIC_DB_USER
               valueFrom:
                 secretKeyRef:
@@ -258,6 +338,26 @@ spec:
                   key: host
             - name: MAUTIC_DB_DATABASE
               value: mautic
+            # RabbitMQ Config
+            - name: MAUTIC_RABBITMQ_HOST
+              value: ${{ defaults.app_name }}-rabbitmq
+            - name: MAUTIC_RABBITMQ_PORT
+              value: '5672'
+            - name: MAUTIC_RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: username
+            - name: MAUTIC_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: password
+            - name: MAUTIC_RABBITMQ_VHOST
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: vhost
           resources:
             requests:
               cpu: 10m
@@ -268,8 +368,25 @@ spec:
           ports:
             - name: http
               protocol: TCP
-              containerPort: 9000
+              containerPort: 80
           imagePullPolicy: IfNotPresent
+          livenessProbe:
+            exec:
+              command:
+                - curl
+                - -f
+                - http://localhost/
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - curl
+                - -f
+                - http://localhost/
+            initialDelaySeconds: 10
+            periodSeconds: 10
           volumeMounts:
             - name: vn-varvn-wwwvn-htmlvn-config
               mountPath: /var/www/html/config
@@ -277,42 +394,61 @@ spec:
               mountPath: /var/www/html/var/logs
             - name: vn-optvn-mauticvn-cron
               mountPath: /opt/mautic/cron
-            - name: vn-varvn-wwwvn-htmlvn-docroot
-              mountPath: /var/www/html/docroot
             - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
               mountPath: /var/www/html/docroot/media/files
             - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
               mountPath: /var/www/html/docroot/media/images
-        - env:
-          - name: PHP_INI_VALUE_DATE_TIMEZONE
-            value: "${{ inputs.TIMEZONE }}"
-          - name: DOCKER_MAUTIC_ROLE
-            value: "mautic_cron"
-          - name: MAUTIC_DB_USER
-            valueFrom:
-              secretKeyRef:
-                key: username
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_PASSWORD
-            valueFrom:
-              secretKeyRef:
-                key: password
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_PORT
-            valueFrom:
-              secretKeyRef:
-                key: port
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_HOST
-            valueFrom:
-              secretKeyRef:
-                key: host
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_DATABASE
-            value: mautic
-          image: mautic/mautic:5.2.3-fpm
+        
+        # CRON CONTAINER
+        - name: ${{ defaults.app_name }}-cron
+          image: mautic/mautic:latest
           imagePullPolicy: IfNotPresent
-          name: ${{ defaults.app_name }}-cron
+          env:
+            - name: PHP_INI_VALUE_DATE_TIMEZONE
+              value: "${{ inputs.TIMEZONE }}"
+            - name: DOCKER_MAUTIC_ROLE
+              value: "mautic_cron"
+            - name: MAUTIC_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  key: port
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  key: host
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_DATABASE
+              value: mautic
+            - name: MAUTIC_RABBITMQ_HOST
+              value: ${{ defaults.app_name }}-rabbitmq
+            - name: MAUTIC_RABBITMQ_PORT
+              value: '5672'
+            - name: MAUTIC_RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: username
+            - name: MAUTIC_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: password
+            - name: MAUTIC_RABBITMQ_VHOST
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: vhost
           resources:
             requests:
               cpu: 10m
@@ -321,51 +457,67 @@ spec:
               cpu: 100m
               memory: 512Mi
           volumeMounts:
-          - mountPath: /etc/nginx/conf.d/default.conf
-            name: vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf
-            subPath: ./etc/nginx/conf.d/default.conf
-          - mountPath: /var/www/html/config
-            name: vn-varvn-wwwvn-htmlvn-config
-          - mountPath: /var/www/html/var/logs
-            name: vn-varvn-wwwvn-htmlvn-varvn-logs
-          - mountPath: /opt/mautic/cron
-            name: vn-optvn-mauticvn-cron
-          - mountPath: /var/www/html/docroot
-            name: vn-varvn-wwwvn-htmlvn-docroot
-          - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
-            mountPath: /var/www/html/docroot/media/files
-          - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
-            mountPath: /var/www/html/docroot/media/images
-        - env:
-          - name: PHP_INI_VALUE_DATE_TIMEZONE
-            value: "${{ inputs.TIMEZONE }}"
-          - name: DOCKER_MAUTIC_ROLE
-            value: "mautic_worker"
-          - name: MAUTIC_DB_USER
-            valueFrom:
-              secretKeyRef:
-                key: username
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_PASSWORD
-            valueFrom:
-              secretKeyRef:
-                key: password
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_PORT
-            valueFrom:
-              secretKeyRef:
-                key: port
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_HOST
-            valueFrom:
-              secretKeyRef:
-                key: host
-                name: mautic-ovqmjzyp-mysql-conn-credential
-          - name: MAUTIC_DB_DATABASE
-            value: mautic
-          image: mautic/mautic:5.2.3-fpm
+            - mountPath: /var/www/html/config
+              name: vn-varvn-wwwvn-htmlvn-config
+            - mountPath: /var/www/html/var/logs
+              name: vn-varvn-wwwvn-htmlvn-varvn-logs
+            - mountPath: /opt/mautic/cron
+              name: vn-optvn-mauticvn-cron
+            - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
+              mountPath: /var/www/html/docroot/media/files
+            - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
+              mountPath: /var/www/html/docroot/media/images
+
+        # WORKER CONTAINER
+        - name: ${{ defaults.app_name }}-worker
+          image: mautic/mautic:latest
           imagePullPolicy: IfNotPresent
-          name: ${{ defaults.app_name }}-worker
+          env:
+            - name: PHP_INI_VALUE_DATE_TIMEZONE
+              value: "${{ inputs.TIMEZONE }}"
+            - name: DOCKER_MAUTIC_ROLE
+              value: "mautic_worker"
+            - name: MAUTIC_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_PORT
+              valueFrom:
+                secretKeyRef:
+                  key: port
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  key: host
+                  name: ${{ defaults.app_name }}-mysql-conn-credential
+            - name: MAUTIC_DB_DATABASE
+              value: mautic
+            - name: MAUTIC_RABBITMQ_HOST
+              value: ${{ defaults.app_name }}-rabbitmq
+            - name: MAUTIC_RABBITMQ_PORT
+              value: '5672'
+            - name: MAUTIC_RABBITMQ_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: username
+            - name: MAUTIC_RABBITMQ_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: password
+            - name: MAUTIC_RABBITMQ_VHOST
+              valueFrom:
+                secretKeyRef:
+                  name: ${{ defaults.app_name }}-rabbitmq
+                  key: vhost
           resources:
             requests:
               cpu: 10m
@@ -374,61 +526,17 @@ spec:
               cpu: 100m
               memory: 512Mi
           volumeMounts:
-          - mountPath: /etc/nginx/conf.d/default.conf
-            name: vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf
-            subPath: ./etc/nginx/conf.d/default.conf
-          - mountPath: /var/www/html/config
-            name: vn-varvn-wwwvn-htmlvn-config
-          - mountPath: /var/www/html/var/logs
-            name: vn-varvn-wwwvn-htmlvn-varvn-logs
-          - mountPath: /opt/mautic/cron
-            name: vn-optvn-mauticvn-cron
-          - mountPath: /var/www/html/docroot
-            name: vn-varvn-wwwvn-htmlvn-docroot
-          - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
-            mountPath: /var/www/html/docroot/media/files
-          - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
-            mountPath: /var/www/html/docroot/media/images
-        - name: ${{ defaults.app_name }}-nginx
-          image: nginx:1.27
-          resources:
-            requests:
-              cpu: 10m
-              memory: 12Mi
-            limits:
-              cpu: 100m
-              memory: 128Mi
-          ports:
-            - name: http
-              protocol: TCP
-              containerPort: 80
-          imagePullPolicy: IfNotPresent
-          readinessProbe:
-            exec:
-              command:
-              - /bin/sh
-              - -c
-              - curl -sf http://127.0.0.1/index.php
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-          volumeMounts:
-            - name: vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf
-              mountPath: /etc/nginx/conf.d/default.conf
-              subPath: ./etc/nginx/conf.d/default.conf
-            - name: vn-varvn-wwwvn-htmlvn-docroot
-              mountPath: /var/www/html/docroot
+            - mountPath: /var/www/html/config
+              name: vn-varvn-wwwvn-htmlvn-config
+            - mountPath: /var/www/html/var/logs
+              name: vn-varvn-wwwvn-htmlvn-varvn-logs
+            - mountPath: /opt/mautic/cron
+              name: vn-optvn-mauticvn-cron
             - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-files
               mountPath: /var/www/html/docroot/media/files
             - name: vn-varvn-wwwvn-htmlvn-docrootvn-mediavn-images
               mountPath: /var/www/html/docroot/media/images
-      volumes:
-        - name: vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf
-          configMap:
-            name: ${{ defaults.app_name }}
-            items:
-              - key: vn-etcvn-nginxvn-confvn-dvn-defaultvn-conf
-                path: ./etc/nginx/conf.d/default.conf
+      volumes: []
   volumeClaimTemplates:
     - metadata:
         annotations:
@@ -457,17 +565,6 @@ spec:
           path: /opt/mautic/cron
           value: '1'
         name: vn-optvn-mauticvn-cron
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        resources:
-          requests:
-            storage: 1Gi
-    - metadata:
-        annotations:
-          path: /var/www/html/docroot
-          value: '1'
-        name: vn-varvn-wwwvn-htmlvn-docroot
       spec:
         accessModes:
           - ReadWriteOnce
@@ -563,5 +660,5 @@ spec:
     url: https://${{ defaults.app_host }}.${{ SEALOS_CLOUD_DOMAIN }}
   displayType: normal
   icon: "https://avatars.githubusercontent.com/u/5257677?s=48&v=4"
-  name: "Mautic"
+  name: "Mautic Apache"
   type: link
